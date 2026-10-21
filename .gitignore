@@ -1,0 +1,11 @@
+# 数据文件含登录 token，不入库
+data.json
+data.selftest.json
+
+# 编译产物 / 依赖
+desktop/src-tauri/target/
+desktop/node_modules/
+
+# 系统 / 临时
+.DS_Store
+*.log

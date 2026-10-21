@@ -1,0 +1,12 @@
+{
+  "name": "api-tool-desktop",
+  "private": true,
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "deploy": "tauri build && cp -R 'src-tauri/target/release/bundle/macos/接口调试.app' /Applications/ && (pkill -f '接口调试.app' || true) && sleep 1 && open /Applications/接口调试.app"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.12.3"
+  }
+}
