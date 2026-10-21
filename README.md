@@ -102,10 +102,13 @@ npm run deploy           # 构建 + 安装到 /Applications + 重启
 ## 自检
 
 ```bash
-node server.mjs --selftest
+node server.mjs --selftest                      # 浏览器版：代理往返、超时取消、来源校验等
+cd desktop/src-tauri && cargo test              # 桌面版：来源校验、耗时统计
 ```
 
-覆盖：状态读写、代理往返、非法请求头拦截、超时中断、主动取消、重定向落点、来源校验。
+覆盖：状态读写、代理往返、非法请求头拦截、超时中断、主动取消、重定向落点、来源校验、批量并发与整批中断。
+
+桌面版单测覆盖两处易错逻辑：来源校验（SSRF 边界，含 `127.0.0.1.evil.com` 这类绕过）、耗时统计（P95 索引越界）。
 
 ## 结构
 

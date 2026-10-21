@@ -43,6 +43,17 @@ fn local_authority(s: &str) -> bool {
     matches!(host, "127.0.0.1" | "localhost")
 }
 
+/// 耗时统计：返回 (avg, min, p95, max)；空样本全为 0
+fn stats(mut ms: Vec<u64>) -> (u64, u64, u64, u64) {
+    if ms.is_empty() {
+        return (0, 0, 0, 0);
+    }
+    ms.sort_unstable();
+    let avg = (ms.iter().sum::<u64>() as f64 / ms.len() as f64).round() as u64;
+    let idx = ((ms.len() as f64 * 0.95) as usize).min(ms.len() - 1);   // 夹紧，防越界
+    (avg, ms[0], ms[idx], ms[ms.len() - 1])
+}
+
 async fn local_guard(req: axum::extract::Request, next: axum::middleware::Next) -> axum::response::Response {
     let host_ok = req.headers().get("host").and_then(|v| v.to_str().ok()).map(local_authority).unwrap_or(false);
     let origin_ok = req.headers().get("origin").and_then(|v| v.to_str().ok()).map(local_authority).unwrap_or(true);
@@ -170,9 +181,7 @@ async fn send_batch(st: Arc<AppState>, body: &Value) -> Value {
     let all = results.lock().await.clone();
     let ok: Vec<&Value> = all.iter().filter(|r| r.get("error").is_none()).collect();
     let fails: Vec<&Value> = all.iter().filter(|r| r.get("error").is_some()).collect();
-    let mut ms: Vec<u64> = ok.iter().filter_map(|r| r["ms"].as_u64()).collect();
-    ms.sort_unstable();
-    let pct = |q: f64| ms.get(((ms.len() as f64 * q) as usize).min(ms.len().saturating_sub(1))).copied().unwrap_or(0);
+    let (avg, min, p95, max) = stats(ok.iter().filter_map(|r| r["ms"].as_u64()).collect());
     let errors: Vec<String> = {
         let mut e: Vec<String> = fails.iter().filter_map(|f| f["error"].as_str().map(String::from)).collect();
         e.sort();
@@ -187,10 +196,10 @@ async fn send_batch(st: Arc<AppState>, body: &Value) -> Value {
         "wall": t0.elapsed().as_millis() as u64,
         "ok": ok.len(),
         "fail": fails.len(),
-        "avg": if ms.is_empty() { 0 } else { (ms.iter().sum::<u64>() as f64 / ms.len() as f64).round() as u64 },
-        "min": ms.first().copied().unwrap_or(0),
-        "p95": pct(0.95),
-        "max": ms.last().copied().unwrap_or(0),
+        "avg": avg,
+        "min": min,
+        "p95": p95,
+        "max": max,
         "errors": errors,
         "last": ok.last().map(|v| (*v).clone()).unwrap_or(Value::Null),
     })
@@ -392,4 +401,66 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 安全边界：这里一旦放宽，任意网页都能把本机当内网跳板
+    #[test]
+    fn allows_only_loopback_authorities() {
+        for ok in [
+            "127.0.0.1",
+            "127.0.0.1:8799",
+            "http://127.0.0.1:52569",
+            "https://127.0.0.1",
+            "localhost",
+            "localhost:8080",
+            "http://localhost:3000/path",
+            "[::1]",
+            "[::1]:8799",
+            "http://[::1]:8799/api/state",
+        ] {
+            assert!(local_authority(ok), "应放行：{ok}");
+        }
+        for bad in [
+            "",
+            "evil.example",
+            "https://evil.example",
+            "evil.example:443",
+            "36.139.127.232:7199",
+            "127.0.0.1.evil.com",
+            "localhost.evil.com",
+            "notlocalhost",
+            "http://192.168.1.1",
+            "http://10.0.0.1:8080",
+        ] {
+            assert!(!local_authority(bad), "应拦截：{bad}");
+        }
+    }
+
+    #[test]
+    fn stats_handles_empty_and_single() {
+        assert_eq!(stats(vec![]), (0, 0, 0, 0));
+        assert_eq!(stats(vec![42]), (42, 42, 42, 42));
+    }
+
+    #[test]
+    fn stats_percentile_never_out_of_bounds() {
+        // 索引 floor(len*0.95) 在 len=20 时正好落在最后一个元素，不能再 +1
+        let twenty: Vec<u64> = (1..=20).collect();
+        assert_eq!(stats(twenty), (11, 1, 20, 20));
+
+        let hundred: Vec<u64> = (1..=100).collect();
+        assert_eq!(stats(hundred), (51, 1, 96, 100));
+
+        let two = vec![10, 90];
+        assert_eq!(stats(two), (50, 10, 90, 90));
+    }
+
+    #[test]
+    fn stats_sorts_input() {
+        assert_eq!(stats(vec![300, 100, 200]), (200, 100, 300, 300));
+    }
 }
