@@ -92,8 +92,9 @@
   .btn.primary:hover { background: var(--pri-deep); border-color: var(--pri-deep); }
   .btn:disabled { opacity: .55; cursor: default; }
   .btn.stop, .btn.primary.stop:hover { background: var(--err); border-color: var(--err); color: #fff; box-shadow: 0 2px 6px rgba(220,38,38,.35); }
-  #timeout, #times { width: 38px; border: 0; padding: 8px 0; font: 12px var(--mono); text-align: center; background: transparent; appearance: textfield; min-width: 0; }
-  #timeout::-webkit-inner-spin-button, #times::-webkit-inner-spin-button { display: none; }
+  #timeout, #times, #conc { width: 38px; border: 0; padding: 8px 0; font: 12px var(--mono); text-align: center; background: transparent; appearance: textfield; -moz-appearance: textfield; min-width: 0; }
+  #timeout::-webkit-inner-spin-button, #times::-webkit-inner-spin-button, #conc::-webkit-inner-spin-button { display: none; }
+  #timeout::-webkit-outer-spin-button, #times::-webkit-outer-spin-button, #conc::-webkit-outer-spin-button { display: none; }
   .mini { display: flex; align-items: center; border: 1px solid var(--bd); border-radius: 9px; background: var(--panel); box-shadow: var(--shadow-sm); transition: border-color .15s, box-shadow .15s; }
   .mini:focus-within { border-color: var(--pri); box-shadow: 0 0 0 3px var(--pri-weak); }
   .mini .ml { padding: 0 3px 0 9px; font-size: 11px; color: var(--dim); white-space: nowrap; }
@@ -277,7 +278,7 @@
       <button class="iconbtn curlbtn" id="copyCurl" title="复制当前请求为 cURL">cURL</button>
       <span class="mini"><span class="ml">超时</span><input id="timeout" type="number" min="1" max="600" value="30" title="超时秒数"><span class="ml">s</span></span>
       <span class="mini"><span class="ml">次数</span><input id="times" type="number" min="1" max="1000" value="1" title="发送总次数"><span class="ml">次</span></span>
-      <span class="mini"><span class="ml">并发</span><input id="conc" type="number" min="1" max="100" value="1" title="同时进行的请求数；1 = 串行，>1 用于并发压测"><span class="ml"></span></span>
+      <span class="mini"><span class="ml">并发</span><input id="conc" type="number" min="1" max="200" value="1" title="同时进行的请求数；1 = 串行，>1 由服务端并发扇出"><span class="ml">路</span></span>
       <button class="btn primary" id="send" title="发送 (⌘↵)；发送中再点 = 停止">发送</button>
     </div>
 
@@ -629,15 +630,10 @@ function markBad(name) {
 
 /* ---------------- 发送 ---------------- */
 let pendingAbort = null, pendingId = null
-const pendingIds = new Set()   // 并发时每个请求有自己的 id，停止时要逐个通知后端中断
 async function send() {
-  if (pendingAbort) {   // 发送中再点 = 停止
+  if (pendingAbort) {   // 发送中再点 = 停止（批量任务整批中断）
     pendingAbort.abort()
-    const ids = [...pendingIds]
-    pendingIds.clear()
-    for (const id of ids) {
-      try { await fetch('/api/abort', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id }) }) } catch {}
-    }
+    try { await fetch('/api/abort', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: pendingId }) }) } catch {}
     return
   }
   const req = currentReq()
@@ -657,7 +653,7 @@ async function send() {
   if (req.bodyType === 'form') body = new URLSearchParams('' + body).toString()
 
   const times = Math.max(1, Math.min(1000, Math.round(Number($('#times').value)) || 1))
-  const conc = Math.max(1, Math.min(100, Math.round(Number($('#conc').value)) || 1))
+  const conc = Math.max(1, Math.min(200, Math.round(Number($('#conc').value)) || 1))
   const timeout = Math.max(1, Number($('#timeout').value) || 30) * 1000
   pendingId = uid(); pendingAbort = new AbortController()
   const setStop = (on) => { $('#send').textContent = on ? '停止' : '发送'; $('#send').classList.toggle('stop', on) }
@@ -665,52 +661,20 @@ async function send() {
   $('#pill').className = 'pill'
   $('#pill').innerHTML = '<span class="spinner"></span>'
   $('#meta').textContent = ''
-  const wall0 = performance.now()
   try {
-    // 滑动窗口并发：开 conc 个 worker 从队列取任务；conc=1 时行为与串行完全一致
-    const results = new Array(times)
-    let next = 0
-    const runOne = async (n) => {
-      const rid = `${pendingId}:${n}`
-      pendingIds.add(rid)
-      try {
-        const d = await (await fetch('/api/send', { method: 'POST', headers: { 'content-type': 'application/json' }, signal: pendingAbort.signal, body: JSON.stringify({ ...req, url, headers, body, timeout, id: rid }) })).json()
-        if (d.error) throw new Error(d.error)
-        return d
-      } finally {
-        pendingIds.delete(rid)
-      }
+    // 并发扇出交给服务端：浏览器对同源最多 6 个连接，前端 worker 池压不上去
+    const post = (path, payload) => fetch(path, { method: 'POST', headers: { 'content-type': 'application/json' }, signal: pendingAbort.signal, body: JSON.stringify(payload) }).then((r) => r.json())
+    if (times === 1) {
+      const d = await post('/api/send', { ...req, url, headers, body, timeout, id: pendingId })
+      if (d.error) throw new Error(d.error)
+      finishSingle(d)
+    } else {
+      const b = await post('/api/batch', { ...req, url, headers, body, timeout, times, concurrency: conc, id: pendingId })
+      if (b.error) throw new Error(b.error)
+      if (b.aborted) throw Object.assign(new Error('已取消'), { name: 'AbortError' })
+      if (!b.last) throw new Error(b.errors?.[0] || '全部请求失败')
+      finishBatch(b)
     }
-    const worker = async () => {
-      while (next < times) {
-        const i = next++
-        try { results[i] = await runOne(i) }
-        catch (e) { results[i] = { error: String(e.message || e), aborted: e.name === 'AbortError' } }
-      }
-    }
-    await Promise.all(Array.from({ length: Math.min(conc, times) }, worker))
-
-    if (results.some((r) => r?.aborted)) throw Object.assign(new Error('已取消'), { name: 'AbortError' })
-    const ok = results.filter((r) => r && !r.error)
-    if (!ok.length) throw new Error(results[0]?.error || '全部请求失败')
-    const d = ok.at(-1)
-    const ms = ok.map((r) => r.ms).sort((a, b) => a - b)
-    const wall = Math.round(performance.now() - wall0)
-    const failN = results.length - ok.length
-
-    respStack.unshift({ url, status: d.status, at: Date.now(), body: d.body })
-    if (respStack.length > 30) respStack.length = 30
-    respText = d.body
-    respHeaders = Object.entries(d.headers).map(([k, v]) => `${k}: ${v}`).join('\n')
-    $('#pill').className = 'pill ' + (d.status < 300 ? 'ok' : d.status < 400 ? 'warn' : 'err')
-    $('#pill').textContent = `${d.status} ${d.statusText || ''}`.trim() + (failN ? ` (${failN} 失败)` : '')
-    const redir = d.finalUrl && d.finalUrl !== url ? ` · → ${d.finalUrl.replace(/^https?:\/\//, '')}` : ''
-    $('#meta').textContent = (times > 1
-      ? `${conc > 1 ? `并发 ${conc} · ` : ''}${times} 次 · 成功 ${ok.length}${failN ? ` / 失败 ${failN}` : ''} · avg ${Math.round(ms.reduce((a, b) => a + b, 0) / ms.length)}ms · P95 ${ms[Math.min(ms.length - 1, Math.floor(ms.length * 0.95))]}ms · max ${ms.at(-1)}ms · 墙钟 ${wall}ms`
-      : `${d.ms}ms · ${fmtSize(d.size)}`) + redir
-    showResp('body')
-    state.history = [{ id: uid(), method: req.method, url, status: d.status, at: Date.now(), req: { ...req, url, headers } }, ...state.history.filter((h) => !(h.method === req.method && h.url === url))].slice(0, 200)
-    renderSide(); persist()
   } catch (e) {
     const cancelled = e.name === 'AbortError'
     $('#pill').className = 'pill err'
@@ -721,6 +685,39 @@ async function send() {
     setStop(false)
     pendingAbort = null; pendingId = null
   }
+}
+
+function finishSingle(d) {
+  respStack.unshift({ url: d.finalUrl || '', status: d.status, at: Date.now(), body: d.body })
+  if (respStack.length > 30) respStack.length = 30
+  respText = d.body
+  respHeaders = Object.entries(d.headers).map(([k, v]) => `${k}: ${v}`).join('\n')
+  $('#pill').className = 'pill ' + (d.status < 300 ? 'ok' : d.status < 400 ? 'warn' : 'err')
+  $('#pill').textContent = `${d.status} ${d.statusText || ''}`.trim()
+  $('#meta').textContent = `${d.ms}ms · ${fmtSize(d.size)}`
+  showResp('body')
+  pushHistory(d.status)
+}
+
+function finishBatch(b) {
+  const d = b.last
+  respStack.unshift({ url: d.finalUrl || '', status: d.status, at: Date.now(), body: d.body })
+  if (respStack.length > 30) respStack.length = 30
+  respText = d.body
+  respHeaders = Object.entries(d.headers).map(([k, v]) => `${k}: ${v}`).join('\n')
+  $('#pill').className = 'pill ' + (d.status < 300 ? 'ok' : d.status < 400 ? 'warn' : 'err')
+  $('#pill').textContent = `${d.status} ${d.statusText || ''}`.trim() + (b.fail ? ` (${b.fail} 失败)` : '')
+  $('#meta').textContent = `${b.concurrency > 1 ? `并发 ${b.concurrency} · ` : ''}${b.times} 次 · 成功 ${b.ok}${b.fail ? ` / 失败 ${b.fail}` : ''} · avg ${b.avg}ms · P95 ${b.p95}ms · max ${b.max}ms · 墙钟 ${b.wall}ms`
+  if (b.errors?.length) toast(b.errors[0], true)
+  showResp('body')
+  pushHistory(d.status)
+}
+
+function pushHistory(status) {
+  const req = currentReq()
+  const url = subst(req.url)
+  state.history = [{ id: uid(), method: req.method, url, status, at: Date.now(), req: { ...req, url, headers: Object.fromEntries(Object.entries(req.headers).map(([k, v]) => [k, subst(v)])) } }, ...state.history.filter((h) => !(h.method === req.method && h.url === url))].slice(0, 200)
+  renderSide(); persist()
 }
 const fmtSize = (n) => n < 1024 ? n + ' B' : n < 1048576 ? (n / 1024).toFixed(1) + ' KB' : (n / 1048576).toFixed(2) + ' MB'
 const resHtml = (html) => { $('#respContent').innerHTML = html }

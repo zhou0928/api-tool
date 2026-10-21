@@ -55,8 +55,9 @@ async function writeState(s) {
 }
 
 const inflight = new Map()   // id → AbortController，供前端「停止」按钮取消
+const batches = new Map()    // 批量任务 id → AbortController，一次中断整批
 
-async function send({ method = 'GET', url, headers = {}, body, timeout, id }) {
+async function send({ method = 'GET', url, headers = {}, body, timeout, id, extSignal }) {
   if (!/^https?:\/\//i.test(url || '')) throw new Error('URL 必须是 http/https 绝对地址')
   const m = method.toUpperCase()
   const h = {}
@@ -72,9 +73,10 @@ async function send({ method = 'GET', url, headers = {}, body, timeout, id }) {
   const t0 = Date.now()
   let res
   try {
-    res = await fetch(url, { method: m, headers: h, body: ['GET', 'HEAD'].includes(m) ? undefined : (body || undefined), redirect: 'follow', signal: AbortSignal.any([ac.signal, AbortSignal.timeout(t)]) })
+    const sig = extSignal ? AbortSignal.any([ac.signal, extSignal, AbortSignal.timeout(t)]) : AbortSignal.any([ac.signal, AbortSignal.timeout(t)])
+    res = await fetch(url, { method: m, headers: h, body: ['GET', 'HEAD'].includes(m) ? undefined : (body || undefined), redirect: 'follow', signal: sig })
   } catch (e) {
-    if (ac.signal.aborted) throw new Error('已取消')
+    if (ac.signal.aborted || extSignal?.aborted) throw new Error('已取消')
     if (e.name === 'TimeoutError') throw new Error(`请求超过 ${t / 1000}s 没有响应，已中断。可在发送按钮左侧调整超时秒数`)
     throw new Error(`连不上目标：${e.cause?.code || e.message}（检查地址/端口/网络）`)
   } finally {
@@ -85,6 +87,47 @@ async function send({ method = 'GET', url, headers = {}, body, timeout, id }) {
   for (const [k, v] of res.headers) rh[k] = v
   const isText = /text|json|xml|javascript|html|csv/i.test(res.headers.get('content-type') || '')
   return { status: res.status, statusText: res.statusText, headers: rh, body: isText ? buf.toString('utf8') : `[二进制 ${buf.length} 字节，content-type: ${res.headers.get('content-type')}]`, size: buf.length, ms: Date.now() - t0, finalUrl: res.url }
+}
+
+// 批量发送：在服务端扇出，绕开浏览器「同源最多 6 个并发连接」的限制
+async function sendBatch({ times = 1, concurrency = 1, id = '', ...opts }) {
+  const n = Math.max(1, Math.min(1000, Number(times) || 1))
+  const c = Math.max(1, Math.min(200, Number(concurrency) || 1))
+  const ac = new AbortController()
+  if (id) batches.set(String(id), ac)
+  const results = []
+  let next = 0
+  const t0 = Date.now()
+  const worker = async () => {
+    while (next < n) {
+      const i = next++
+      if (ac.signal.aborted) return
+      try {
+        const r = await send({ ...opts, id: `${id}:${i}`, extSignal: ac.signal })
+        results.push({ ok: true, ms: r.ms, resp: r })
+      } catch (e) {
+        results.push({ ok: false, error: String(e?.message || e) })
+      }
+    }
+  }
+  try {
+    await Promise.all(Array.from({ length: Math.min(c, n) }, worker))
+  } finally {
+    if (id) batches.delete(String(id))
+  }
+  const ok = results.filter((r) => r.ok)
+  const fail = results.filter((r) => !r.ok)
+  const ms = ok.map((r) => r.ms).sort((a, b) => a - b)
+  const pct = (q) => (ms.length ? ms[Math.min(ms.length - 1, Math.floor(ms.length * q))] : 0)
+  return {
+    aborted: ac.signal.aborted,
+    times: n, concurrency: c, wall: Date.now() - t0,
+    ok: ok.length, fail: fail.length,
+    avg: ms.length ? Math.round(ms.reduce((a, b) => a + b, 0) / ms.length) : 0,
+    min: ms[0] || 0, p95: pct(0.95), max: ms.at(-1) || 0,
+    errors: [...new Set(fail.map((f) => f.error))].slice(0, 3),
+    last: ok.at(-1)?.resp || null,
+  }
 }
 
 const server = createServer(async (req, res) => {
@@ -103,10 +146,15 @@ const server = createServer(async (req, res) => {
     if (u.pathname === '/api/abort' && req.method === 'POST') {
       const { id } = JSON.parse((await readBody(req)) || '{}')
       inflight.get(String(id))?.abort()
+      batches.get(String(id))?.abort()
       return json(res, 200, { ok: true })
     }
     if (u.pathname === '/api/slow') { await new Promise((r) => setTimeout(r, 400)); return json(res, 200, { ok: 1 }) }   // 自检用慢路由
     if (u.pathname === '/api/r302') { res.writeHead(302, { location: '/api/ping' }); return res.end() }   // 自检用重定向路由
+    if (u.pathname === '/api/batch' && req.method === 'POST') {
+      try { return json(res, 200, await sendBatch(JSON.parse((await readBody(req)) || '{}'))) }
+      catch (e) { return json(res, 200, { error: String(e?.message || e) }) }
+    }
     if (u.pathname === '/api/send' && req.method === 'POST') {
       try { return json(res, 200, await send(JSON.parse((await readBody(req)) || '{}'))) }
       catch (e) { return json(res, 200, { error: String(e?.message || e) }) }
@@ -155,6 +203,14 @@ if (process.argv.includes('--selftest')) {
   assert.match((await abortP).error, /取消/)
   const redir = await call('/api/send', { url: `${base}/api/r302` })
   assert.equal(redir.finalUrl, `${base}/api/ping`)
+
+  const batch = await call('/api/batch', { url: `${base}/api/slow`, times: 20, concurrency: 20, timeout: 5 })
+  assert.equal(batch.ok, 20)
+  assert.ok(batch.wall < 1200, `服务端 20 并发应远快于串行 8s，实际 ${batch.wall}ms`)
+  const batchAbort = call('/api/batch', { url: `${base}/api/slow`, times: 20, concurrency: 20, id: 'b1' })
+  await new Promise((r) => setTimeout(r, 120))
+  await call('/api/abort', { id: 'b1' })
+  assert.equal((await batchAbort).aborted, true)
 
   const evil = await fetch(`${base}/api/state`, { headers: { origin: 'https://evil.example' } })
   assert.equal(evil.status, 403)

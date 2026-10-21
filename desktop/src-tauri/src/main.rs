@@ -4,8 +4,8 @@
 
 use axum::{
     extract::State,
-    middleware::{self, Next},
-    response::{Html, IntoResponse, Response},
+    middleware::{self},
+    response::{Html, IntoResponse},
     routing::{get, post},
     Json, Router,
 };
@@ -111,10 +111,92 @@ async fn abort_req(State(st): State<Arc<AppState>>, Json(body): Json<Value>) -> 
 
 #[axum::debug_handler]
 async fn api_send(State(st): State<Arc<AppState>>, Json(body): Json<Value>) -> Json<Value> {
-    Json(send_once(&st, &body).await)
+    Json(send_once(&st, &body, None).await)
 }
 
-async fn send_once(st: &AppState, body: &Value) -> Value {
+#[axum::debug_handler]
+async fn api_batch(State(st): State<Arc<AppState>>, Json(body): Json<Value>) -> Json<Value> {
+    Json(send_batch(st, &body).await)
+}
+
+// 批量发送：在服务端扇出，绕开浏览器「同源最多 6 个并发连接」的限制
+async fn send_batch(st: Arc<AppState>, body: &Value) -> Value {
+    let times = body["times"].as_u64().unwrap_or(1).clamp(1, 1000);
+    let conc = body["concurrency"].as_u64().unwrap_or(1).clamp(1, 200);
+    let id = body["id"].as_str().unwrap_or_default().to_string();
+    let token = CancellationToken::new();
+    if !id.is_empty() {
+        st.cancels.lock().await.insert(id.clone(), token.clone());
+    }
+    let t0 = Instant::now();
+    let counter = Arc::new(Mutex::new(0u64));
+    let results = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let mut handles = Vec::new();
+    for _ in 0..conc.min(times) {
+        let stc = st.clone();
+        let b = body.clone();
+        let tk = token.clone();
+        let c = counter.clone();
+        let rs = results.clone();
+        let idc = id.clone();
+        handles.push(tauri::async_runtime::spawn(async move {
+            loop {
+                if tk.is_cancelled() {
+                    return;
+                }
+                let i = {
+                    let mut g = c.lock().await;
+                    if *g >= times {
+                        return;
+                    }
+                    *g += 1;
+                    *g
+                };
+                let mut one = b.clone();
+                if let Some(o) = one.as_object_mut() {
+                    o.insert("id".into(), json!(format!("{idc}:{i}")));
+                }
+                let r = send_once(&stc, &one, Some(tk.clone())).await;
+                rs.lock().await.push(r);
+            }
+        }));
+    }
+    for h in handles {
+        let _ = h.await;
+    }
+    if !id.is_empty() {
+        st.cancels.lock().await.remove(&id);
+    }
+    let all = results.lock().await.clone();
+    let ok: Vec<&Value> = all.iter().filter(|r| r.get("error").is_none()).collect();
+    let fails: Vec<&Value> = all.iter().filter(|r| r.get("error").is_some()).collect();
+    let mut ms: Vec<u64> = ok.iter().filter_map(|r| r["ms"].as_u64()).collect();
+    ms.sort_unstable();
+    let pct = |q: f64| ms.get(((ms.len() as f64 * q) as usize).min(ms.len().saturating_sub(1))).copied().unwrap_or(0);
+    let errors: Vec<String> = {
+        let mut e: Vec<String> = fails.iter().filter_map(|f| f["error"].as_str().map(String::from)).collect();
+        e.sort();
+        e.dedup();
+        e.truncate(3);
+        e
+    };
+    json!({
+        "aborted": token.is_cancelled(),
+        "times": times,
+        "concurrency": conc,
+        "wall": t0.elapsed().as_millis() as u64,
+        "ok": ok.len(),
+        "fail": fails.len(),
+        "avg": if ms.is_empty() { 0 } else { (ms.iter().sum::<u64>() as f64 / ms.len() as f64).round() as u64 },
+        "min": ms.first().copied().unwrap_or(0),
+        "p95": pct(0.95),
+        "max": ms.last().copied().unwrap_or(0),
+        "errors": errors,
+        "last": ok.last().map(|v| (*v).clone()).unwrap_or(Value::Null),
+    })
+}
+
+async fn send_once(st: &AppState, body: &Value, ext: Option<CancellationToken>) -> Value {
     let t0 = Instant::now();
     let err = |e: String| json!({ "error": e });
 
@@ -176,6 +258,17 @@ async fn send_once(st: &AppState, body: &Value) -> Value {
 
     let res = tokio::select! {
         _ = token.cancelled() => {
+            if !id.is_empty() {
+                st.cancels.lock().await.remove(&id);
+            }
+            return err("已取消".into());
+        }
+        _ = async {
+            match &ext {
+                Some(e) => e.cancelled().await,
+                None => std::future::pending::<()>().await,
+            }
+        } => {
             if !id.is_empty() {
                 st.cancels.lock().await.remove(&id);
             }
@@ -272,6 +365,7 @@ fn main() {
             let router = Router::new()
                 .route("/", get(index))
                 .route("/api/send", post(api_send))
+                .route("/api/batch", post(api_batch))
                 .route("/api/abort", post(abort_req))
                 .route("/api/state", get(state_get).post(state_post))
                 .with_state(state)
