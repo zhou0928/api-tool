@@ -1137,7 +1137,7 @@ $('#diffBtn').onclick = () => {
   try { state = await (await fetch('/api/state')).json() } catch { toast('读取本地数据失败', true) }
   // 旧数据迁移：单套 env → 多环境
   if (!state.envs || !Object.keys(state.envs).length) {
-    state.envs = { '默认': state.env && Object.keys(state.env).length ? state.env : { baseUrl: 'http://36.139.127.232:7199', token: '' } }
+    state.envs = { '默认': state.env && Object.keys(state.env).length ? state.env : { baseUrl: 'http://localhost:8080', token: '' } }
     state.envActive = '默认'
   }
   if (!state.envs[state.envActive]) state.envActive = Object.keys(state.envs)[0]
@@ -1146,7 +1146,7 @@ $('#diffBtn').onclick = () => {
   renderSide(); renderEnvSel(); renderEnv()
   if (state.draft?.url) fill(state.draft)
   else {
-    kvEditor($('#kvHeaders'), { Authorization: 'Basic c2FiZXI6c2FiZXJfc2VjcmV0', 'Blade-Auth': 'bearer {{token}}' }, updateCounts)
+    kvEditor($('#kvHeaders'), { Authorization: 'Bearer {{token}}' }, updateCounts)
     syncParamsFromUrl()
   }
 })()
