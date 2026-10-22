@@ -1,18 +1,25 @@
 // 零依赖生成 1024x1024 应用图标：圆角蓝底 + 白色 [ / ] 图形
+// 遵守 macOS 图标规范：1024 画布中图标本体只占 824x824，四周各留 100px 透明边距，
+// 否则在 Dock / 启动台里会比系统图标显得大一圈。
 import { deflateSync, crc32 } from 'node:zlib'
 import { writeFileSync } from 'node:fs'
 
 const W = 1024
+const BODY = 824                    // 系统规范：图标主体边长
+const SCALE = BODY / W              // 逻辑坐标 → 画布坐标
+const OFF = (W - BODY) / 2          // 居中偏移
 const px = Buffer.alloc(W * W * 4)
 const set = (x, y, [r, g, b]) => {
-  x |= 0; y |= 0
-  if (x < 0 || y < 0 || x >= W || y >= W) return
-  const i = (y * W + x) * 4
+  // 逻辑坐标（0..1023）映射到居中的 824x824 主体区域
+  const X = Math.round(x * SCALE + OFF)
+  const Y = Math.round(y * SCALE + OFF)
+  if (X < 0 || Y < 0 || X >= W || Y >= W) return
+  const i = (Y * W + X) * 4
   px[i] = r; px[i + 1] = g; px[i + 2] = b; px[i + 3] = 255
 }
 
-// 圆角底
-const R = 185, BG = [37, 99, 235]
+// 圆角底（逻辑空间 R 换算到画布后约 185px，贴合 macOS squircle 观感）
+const R = 230, BG = [37, 99, 235]
 for (let y = 0; y < W; y++) {
   for (let x = 0; x < W; x++) {
     const dx = Math.max(R - x, x - (W - 1 - R), 0)
@@ -66,4 +73,15 @@ const png = Buffer.concat([
   chunk('IEND', Buffer.alloc(0)),
 ])
 writeFileSync(new URL('./icon.png', import.meta.url), png)
-console.log('icon.png', png.length, 'bytes')
+
+// 自检：内容边界必须落在 100px 边距内，否则 Dock 里会比系统图标显大
+let minX = W, minY = W, maxX = -1, maxY = -1
+for (let y = 0; y < W; y++) for (let x = 0; x < W; x++) {
+  if (px[(y * W + x) * 4 + 3] > 0) {
+    if (x < minX) minX = x; if (x > maxX) maxX = x
+    if (y < minY) minY = y; if (y > maxY) maxY = y
+  }
+}
+const margin = Math.min(minX, minY, W - 1 - maxX, W - 1 - maxY)
+if (margin < 95 || margin > 105) throw new Error(`图标边距 ${margin}px，应在 100px 左右`)
+console.log(`icon.png ${png.length} bytes，内容 ${maxX - minX + 1}x${maxY - minY + 1}，边距 ${margin}px ✓`)
