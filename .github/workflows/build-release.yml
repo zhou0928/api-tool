@@ -3,6 +3,11 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:        # 手动触发（如给已有 release 补 Windows 包）
+    inputs:
+      tag:
+        description: '目标 Release tag（默认 v1.0.0）'
+        required: false
+        default: 'v1.0.0'
 
 jobs:
   build:
@@ -41,6 +46,8 @@ jobs:
       - name: 上传产物到 Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: |
             desktop/src-tauri/target/release/bundle/dmg/*.dmg
             desktop/src-tauri/target/release/bundle/nsis/*.exe
+          overwrite_files: true
