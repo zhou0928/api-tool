@@ -125,6 +125,17 @@ desktop/
 
 浏览器版与桌面版共用同一份 `index.html`：桌面版在编译期将其嵌入二进制，通过内嵌的 axum 服务提供同等 API。
 
+## 常见问题
+
+**macOS 首次打开提示「已损坏，无法打开」**
+开源应用未做 Apple 公证，Gatekeeper 会拦截。不是文件损坏，解除方法任选其一：
+
+```bash
+sudo xattr -dr com.apple.quarantine "/Applications/接口调试.app"
+```
+
+或右键应用 → 打开 → 仍要打开；或系统设置 → 隐私与安全性 → 仍要打开。
+
 ## License
 
 MIT
