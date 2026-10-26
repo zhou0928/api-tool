@@ -9,6 +9,9 @@ on:
         required: false
         default: 'v1.0.0'
 
+permissions:
+  contents: write           # GITHUB_TOKEN 需要写 Release；仓库默认 read，这里显式提升
+
 jobs:
   build:
     strategy:
