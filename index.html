@@ -343,6 +343,12 @@ let state = { env: {}, envs: null, envActive: '', draft: null, collections: [], 
 let respText = '', respHeaders = '', activeReq = null, sideTab = 'col', query = ''
 let respStack = []   // 本次会话的最近响应（内存态，供响应 Diff 用）
 
+// 响应栈：只保留 ≤500KB 的 body 供 Diff 用，超大响应不占内存（30 条上限不变）
+const pushStack = (d) => {
+  respStack.unshift({ url: d.finalUrl || '', status: d.status, at: Date.now(), body: (d.body || '').length <= 500000 ? d.body : '' })
+  if (respStack.length > 30) respStack.length = 30
+}
+
 /* ---------------- 基础 ---------------- */
 const toast = (msg, err) => {
   const d = document.createElement('div')
@@ -600,8 +606,14 @@ const currentReq = () => ({
   body: $('#body').value,
 })
 
-// 草稿：所有编辑路径最终都会经过 updateCounts / 这些 oninput，刷新页面可恢复
-const saveDraft = () => { state.draft = { ...currentReq() }; persist() }
+// 草稿：所有编辑路径最终都会经过 updateCounts / 这些 oninput，刷新页面可恢复。
+// 超大 body（>200KB）跳过自动保存——避免每次输入全量序列化+上传卡顿，手动保存不受影响
+const saveDraft = () => {
+  const r = currentReq()
+  if ((r.body || '').length > 200000) return
+  state.draft = { ...r }
+  persist()
+}
 
 const paintMethod = () => { $('#method').className = 'm ' + $('#method').value }
 $('#method').onchange = () => { paintMethod(); saveDraft() }
@@ -630,6 +642,7 @@ function markBad(name) {
 
 /* ---------------- 发送 ---------------- */
 let pendingAbort = null, pendingId = null
+let qTimer            // 搜索防抖定时器
 async function send() {
   if (pendingAbort) {   // 发送中再点 = 停止（批量任务整批中断）
     pendingAbort.abort()
@@ -688,8 +701,7 @@ async function send() {
 }
 
 function finishSingle(d) {
-  respStack.unshift({ url: d.finalUrl || '', status: d.status, at: Date.now(), body: d.body })
-  if (respStack.length > 30) respStack.length = 30
+  pushStack(d)
   respText = d.body
   respHeaders = Object.entries(d.headers).map(([k, v]) => `${k}: ${v}`).join('\n')
   $('#pill').className = 'pill ' + (d.status < 300 ? 'ok' : d.status < 400 ? 'warn' : 'err')
@@ -701,8 +713,7 @@ function finishSingle(d) {
 
 function finishBatch(b) {
   const d = b.last
-  respStack.unshift({ url: d.finalUrl || '', status: d.status, at: Date.now(), body: d.body })
-  if (respStack.length > 30) respStack.length = 30
+  pushStack(d)
   respText = d.body
   respHeaders = Object.entries(d.headers).map(([k, v]) => `${k}: ${v}`).join('\n')
   $('#pill').className = 'pill ' + (d.status < 300 ? 'ok' : d.status < 400 ? 'warn' : 'err')
@@ -825,7 +836,11 @@ document.addEventListener('paste', (e) => {
 })
 
 $('#url').oninput = () => { syncParamsFromUrl() }
-$('#q').oninput = (e) => { query = e.target.value.trim(); renderSide() }
+$('#q').oninput = (e) => {
+  query = e.target.value.trim()
+  clearTimeout(qTimer)
+  qTimer = setTimeout(renderSide, 120)   // 防抖：集合多时避免每次击键全量重建列表
+}
 $$('[data-tab]').forEach((b) => b.onclick = () => {
   sideTab = b.dataset.tab
   $$('[data-tab]').forEach((x) => x.classList.toggle('on', x === b))

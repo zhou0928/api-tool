@@ -39,6 +39,7 @@ jobs:
           cd desktop
           npx tauri build
           ./make-dmg.sh
+          ./make-zip.sh
 
       - name: 构建 Windows（NSIS 安装器）
         if: runner.os == 'Windows'
@@ -52,5 +53,6 @@ jobs:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: |
             desktop/src-tauri/target/release/bundle/dmg/*.dmg
+            desktop/src-tauri/target/release/bundle/dmg/*.zip
             desktop/src-tauri/target/release/bundle/nsis/*.exe
           overwrite_files: true
