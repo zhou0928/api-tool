@@ -31,9 +31,10 @@ ln -s /Applications "$STAGE/Applications"
 import ds_store, sys
 stage = sys.argv[1]
 ds = ds_store.DSStore.open(f'{stage}/.DS_Store', 'w+')
+# 注意：Finder 的 bwsp 键是 windowWidth/windowHeight（小写 w），写错 Finder 不认
 ds['.']['bwsp'] = {
-    'WindowHeight': 420.0, 'WindowWidth': 620.0,
-    'IconSize': 96.0, 'ShowStatusBar': False, 'ShowToolbar': False,
+    'windowWidth': 620.0, 'windowHeight': 420.0,
+    'iconSize': 96.0, 'showToolbar': False, 'showStatusBar': False,
     'arrangement': 2,
 }
 ds['接口调试.app']['Iloc'] = (160, 180)
