@@ -9,3 +9,4 @@ desktop/node_modules/
 # 系统 / 临时
 .DS_Store
 *.log
+desktop/ds-venv/
