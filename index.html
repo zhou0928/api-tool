@@ -1100,17 +1100,37 @@ function jwtExp(t) {
     return p.exp ? p.exp * 1000 : null
   } catch { return null }
 }
+// 真正承载鉴权的头：只有它们过期才会 401。Cookie 里的 JWT 多为残留，不作为凭证判断
+const AUTH_HEADERS = ['authorization', 'blade-auth']
 function checkJwt() {
-  const now = Date.now(), msgs = []
-  for (const [k, v] of Object.entries(readHeaders())) {
+  const now = Date.now(), msgs = [], seen = new Set()
+  const heads = readHeaders()
+  // 先找鉴权凭证的到期时间：取鉴权头里最早的一个
+  let authExp = null
+  for (const k of Object.keys(heads)) {
+    if (!AUTH_HEADERS.includes(k.toLowerCase())) continue
+    for (const t of (String(heads[k]).match(JWT_RE) || [])) {
+      const exp = jwtExp(t)
+      if (exp && (authExp === null || exp < authExp)) authExp = exp
+    }
+  }
+  // 鉴权凭证有效 → 其余残留 token 不再告警，仅提示凭证本身临近到期
+  if (authExp !== null && authExp >= now) {
+    msgs.push(authExp - now < 30 * 60000 ? `<div class="jwtwarn soon">⏳ 鉴权 token 将在 ${Math.max(1, Math.round((authExp - now) / 60000))} 分钟内过期</div>` : '')
+  }
+  for (const [k, v] of Object.entries(heads)) {
     for (const t of (String(v).match(JWT_RE) || []).slice(0, 2)) {
+      if (seen.has(t)) continue
       const exp = jwtExp(t)
       if (!exp) continue
+      seen.add(t)
+      // 凭证有效时不提示非鉴权头里的残留过期 token；凭证缺失/过期时全量提示
+      if (authExp !== null && authExp >= now && !AUTH_HEADERS.includes(k.toLowerCase())) continue
       if (exp < now) msgs.push(`<div class="jwtwarn">⚠ ${esc(k)}：token 已过期 ${Math.max(1, Math.round((now - exp) / 86400000))} 天（${new Date(exp).toLocaleString()} 到期），请求多半会 401</div>`)
       else if (exp - now < 30 * 60000) msgs.push(`<div class="jwtwarn soon">⏳ ${esc(k)}：token 将在 ${Math.max(1, Math.round((exp - now) / 60000))} 分钟内过期</div>`)
     }
   }
-  $('#jwtWarn').innerHTML = msgs.slice(0, 3).join('')
+  $('#jwtWarn').innerHTML = msgs.filter(Boolean).slice(0, 3).join('')
   const expired = msgs.some((m) => m.includes('⚠'))
   const soon = msgs.some((m) => m.includes('⏳'))
   const cnt = $('#cntH')
